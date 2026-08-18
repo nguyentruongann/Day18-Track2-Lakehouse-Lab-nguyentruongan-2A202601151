@@ -6,13 +6,21 @@ The Delta tables on disk are the *same format* Spark/Databricks would write,
 so a student can later point Spark at `_lakehouse/silver/llm_calls` and get
 the same data. This is the value of an open table format.
 """
+
 from __future__ import annotations
 
 import os
+import weakref
 from pathlib import Path
 
+
 # Repo-local lakehouse — easy to inspect, easy to wipe.
-ROOT = Path(os.environ.get("LAKEHOUSE_ROOT", Path(__file__).resolve().parents[1] / "_lakehouse"))
+ROOT = Path(
+    os.environ.get(
+        "LAKEHOUSE_ROOT",
+        Path(__file__).resolve().parents[1] / "_lakehouse",
+    )
+)
 
 
 def path(layer: str, table: str) -> str:
@@ -28,72 +36,185 @@ def path(layer: str, table: str) -> str:
 def reset(*paths: str) -> None:
     """Delete tables (idempotent rerun support). No-op if missing."""
     import shutil
+
     for p in paths:
         shutil.rmtree(p, ignore_errors=True)
 
 
 # ── Convenience: swap to S3 / MinIO with one env var ──
 # To target s3://bucket/key instead of local disk, set:
+#
 #   LAKEHOUSE_ROOT=s3://my-bucket/lakehouse
 #   AWS_* env vars per usual
+#
 # delta-rs handles the s3:// scheme natively (no Hadoop, no JVM).
 
 
 # ══════════════════════════════════════════════════════════════════════
 # Iceberg catalog (NB5, NB6, NB8)
 # ══════════════════════════════════════════════════════════════════════
+#
 # A *catalog* is what turns a pile of Parquet into a table people can find.
-# Production uses a REST catalog (Polaris, Unity, Lakekeeper, Glue). Locally
-# we use pyiceberg's SqlCatalog on SQLite: same Python API, same on-disk
-# Iceberg metadata, no server to run. Swapping to a real REST catalog is a
-# config change, not a code change — that's the whole point of the REST spec.
+# Production uses a REST catalog (Polaris, Unity, Lakekeeper, Glue).
+#
+# Locally we use pyiceberg's SqlCatalog on SQLite: same Python API,
+# same on-disk Iceberg metadata, no server to run.
+#
+# Swapping to a real REST catalog is a config change, not a code change —
+# that's the whole point of the REST spec.
 
 ICEBERG_ROOT = ROOT / "iceberg"
+
+
+# Track live SqlCatalog instances by catalog name.
+#
+# Why weak references?
+# - reset_catalog() needs to close SQLite/SQLAlchemy handles on Windows.
+# - but this registry must NOT keep catalog objects alive forever.
+#
+# Weak references let us reach a catalog if it is still alive while allowing
+# normal garbage collection when notebook/test code releases it.
+_OPEN_CATALOGS: dict[str, list[weakref.ReferenceType]] = {}
 
 
 def _catalog_dir(name: str) -> Path:
     """Each caller gets its OWN catalog directory.
 
-    Why not one shared catalog? Because notebooks reset their catalog on rerun,
-    and students keep several notebooks open in Jupyter Lab at once. A shared
-    directory means NB6 starting up deletes the catalog NB5 is mid-way through
-    — an intermittent failure that looks like a corrupt install, not a race.
-    Isolation by name makes cross-notebook interference structurally impossible.
+    Why not one shared catalog?
+
+    Because notebooks reset their catalog on rerun, and students may keep
+    several notebooks open in Jupyter Lab at once.
+
+    A shared directory means NB6 starting up could delete the catalog NB5
+    is using — an intermittent failure that looks like a corrupt install.
+
+    Isolation by name makes cross-notebook interference structurally
+    impossible.
     """
     return ICEBERG_ROOT / name
 
 
 def catalog(name: str = "lab"):
-    """Return a local Iceberg catalog, isolated under its own directory.
+    """Return a local Iceberg catalog isolated under its own directory.
 
-    Production equivalent (one-line swap — note the identical call site):
+    Production equivalent:
 
         from pyiceberg.catalog import load_catalog
-        cat = load_catalog("prod", **{
-            "type": "rest",
-            "uri": "https://polaris.example.com/api/catalog",
-            "credential": "<client_id>:<client_secret>",
-        })
+
+        cat = load_catalog(
+            "prod",
+            **{
+                "type": "rest",
+                "uri": "https://polaris.example.com/api/catalog",
+                "credential": "<client_id>:<client_secret>",
+            },
+        )
+
+    The notebook call site remains effectively the same.
     """
     from pyiceberg.catalog.sql import SqlCatalog
 
     d = _catalog_dir(name)
+
+    # Warehouse is separate per catalog.
     (d / "warehouse").mkdir(parents=True, exist_ok=True)
-    return SqlCatalog(
+
+    cat = SqlCatalog(
         name,
         uri=f"sqlite:///{d / 'catalog.db'}",
         warehouse=f"file://{d / 'warehouse'}",
     )
 
+    # Keep only a weak reference.
+    #
+    # This is especially important on Windows because SQLite files cannot
+    # be removed while SQLAlchemy still owns an open handle.
+    _OPEN_CATALOGS.setdefault(name, []).append(weakref.ref(cat))
+
+    return cat
+
+
+def _close_catalog(cat) -> None:
+    """Best-effort close/dispose for a live PyIceberg SqlCatalog.
+
+    PyIceberg versions may expose either:
+      - close()
+      - engine.dispose()
+
+    Supporting both keeps this helper compatible across versions.
+    """
+    try:
+        close = getattr(cat, "close", None)
+
+        if callable(close):
+            close()
+            return
+    except Exception:
+        # Fall through to explicit engine disposal.
+        pass
+
+    try:
+        engine = getattr(cat, "engine", None)
+
+        if engine is not None:
+            dispose = getattr(engine, "dispose", None)
+
+            if callable(dispose):
+                dispose()
+    except Exception:
+        # Cleanup is best-effort here. reset_catalog() will surface an actual
+        # filesystem failure if Windows still cannot remove the directory.
+        pass
+
 
 def reset_catalog(name: str = "lab") -> None:
     """Drop ONE catalog so a notebook rerun starts clean.
 
-    Scoped to `name` on purpose — see `_catalog_dir`.
-    """
-    import shutil
+    Only the requested catalog directory is touched.
 
-    shutil.rmtree(_catalog_dir(name), ignore_errors=True)
+    On Windows, SQLite/SQLAlchemy may keep `catalog.db` open while the
+    SqlCatalog Python object is still alive. Before deleting the directory,
+    explicitly close every live catalog instance registered for this name.
+    """
+    import gc
+    import shutil
+    import time
+
+    target = _catalog_dir(name)
+
+    # Remove only this catalog name from the registry.
+    #
+    # Catalogs such as "nb5", "nb6", "keep", etc. remain completely
+    # independent.
+    refs = _OPEN_CATALOGS.pop(name, [])
+
+    for ref in refs:
+        cat = ref()
+
+        if cat is not None:
+            _close_catalog(cat)
+
+    # Encourage Python/SQLAlchemy to release any final references/handles.
+    gc.collect()
+
+    # Windows can release SQLite handles a tiny bit later than dispose().
+    # Retry deletion briefly instead of silently swallowing the failure.
+    for attempt in range(10):
+        try:
+            shutil.rmtree(target)
+            return
+
+        except FileNotFoundError:
+            # Idempotent reset: already gone = success.
+            return
+
+        except PermissionError:
+            gc.collect()
+
+            if attempt == 9:
+                raise
+
+            time.sleep(0.1)
 
 
 def namespace(cat, ns: str = "lake"):
@@ -102,8 +223,10 @@ def namespace(cat, ns: str = "lake"):
 
     try:
         cat.create_namespace(ns)
+
     except NamespaceAlreadyExistsError:
         pass
+
     return ns
 
 
@@ -111,36 +234,72 @@ def namespace(cat, ns: str = "lake"):
 # Measurement helpers — every mission has to *show a number*
 # ══════════════════════════════════════════════════════════════════════
 
+
 def du(target: str | Path) -> int:
     """Total bytes under a path (data + metadata). Missing path → 0."""
     p = Path(target)
+
     if not p.exists():
         return 0
+
     if p.is_file():
         return p.stat().st_size
-    return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+
+    return sum(
+        f.stat().st_size
+        for f in p.rglob("*")
+        if f.is_file()
+    )
 
 
 def human(n_bytes: float) -> str:
     """1234567 → '1.2 MB'. Keeps notebook output readable."""
     for unit in ("B", "KB", "MB", "GB"):
         if abs(n_bytes) < 1024 or unit == "GB":
-            return f"{n_bytes:.1f} {unit}" if unit != "B" else f"{int(n_bytes)} B"
+            if unit == "B":
+                return f"{int(n_bytes)} B"
+
+            return f"{n_bytes:.1f} {unit}"
+
         n_bytes /= 1024
+
     return f"{n_bytes:.1f} GB"
 
 
-def count_files(target: str | Path, suffix: str = ".parquet") -> int:
-    """How many data files back this table? The small-file problem, quantified."""
-    return len(list(Path(target).rglob(f"*{suffix}")))
+def count_files(
+    target: str | Path,
+    suffix: str = ".parquet",
+) -> int:
+    """How many data files back this table?
+
+    Used to quantify the small-file problem.
+    """
+    return len(
+        list(
+            Path(target).rglob(
+                f"*{suffix}"
+            )
+        )
+    )
 
 
 def to_arrow(relation):
-    """Materialise a DuckDB relation as a pyarrow.Table, across DuckDB versions.
+    """Materialise a DuckDB relation as a pyarrow.Table.
 
-    DuckDB ≤1.2 returned a `pa.Table` from `.arrow()`; ≥1.3 returns a
-    streaming `RecordBatchReader`. Notebooks want a Table (they call
-    `.num_rows`, `.to_pandas()`), so normalise here instead of pinning DuckDB.
+    DuckDB <= 1.2 returned a pa.Table from `.arrow()`.
+
+    DuckDB >= 1.3 may return a streaming RecordBatchReader.
+
+    Notebooks expect a Table because they call methods such as:
+      - .num_rows
+      - .to_pandas()
+
+    Normalise the result here rather than pinning DuckDB to one version.
     """
     out = relation.arrow()
-    return out.read_all() if hasattr(out, "read_all") else out
+
+    return (
+        out.read_all()
+        if hasattr(out, "read_all")
+        else out
+    )
